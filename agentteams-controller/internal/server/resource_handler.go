@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -168,15 +169,24 @@ func (h *ResourceHandler) GetWorker(w http.ResponseWriter, r *http.Request) {
 		} else if ok {
 			applyTeamMember(&resp, team, member)
 		}
-		// Scoped readers (team leaders or L2 humans) may only fetch workers
-		// in the teams they control; standalone workers are hidden. W8: return
-		// 404 (not 403) so scoped callers cannot probe worker existence by
-		// name — consistent with the project enumeration fix (W4).
-		if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
+		// Scoped readers (team leaders or humans) may only fetch workers in
+		// the teams they control; L3 (worker-scoped) humans may additionally
+		// fetch exactly their assigned workers (standalone or team members).
+		// W8: return 404 (not 403) so scoped callers cannot probe worker
+		// existence by name — consistent with the project enumeration fix
+		// (W4).
+		caller := authpkg.CallerFromContext(r.Context())
+		if caller != nil &&
 			(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
-			!caller.TeamMatches(resp.Team) {
+			!caller.WorkerReadable(resp.Team, name) {
 			httputil.WriteError(w, http.StatusNotFound, "get worker: not found")
 			return
+		}
+		// L3 (worker-scoped) readers never receive plaintext credentials:
+		// scrub the MCP endpoint URLs before the response leaves the server.
+		// Other callers get the verbatim spec.
+		if caller != nil && caller.IsWorkerScoped() {
+			sanitizeWorkerResponseForL3(&resp)
 		}
 		httputil.WriteJSON(w, http.StatusOK, resp)
 		return
@@ -207,13 +217,20 @@ func (h *ResourceHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		} else if ok {
 			applyTeamMember(&resp, team, member)
 		}
-		// Scoped readers (team leaders or L2 humans) only see the workers in
-		// the teams they control; standalone workers are hidden.
-		if caller != nil && (caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) && !caller.TeamMatches(resp.Team) {
+		// Scoped readers (team leaders or humans) only see the workers in
+		// the teams they control; L3 (worker-scoped) humans only see their
+		// explicitly assigned workers (standalone or team members).
+		if caller != nil && (caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) && !caller.WorkerReadable(resp.Team, list.Items[i].Name) {
 			continue
 		}
 		if teamFilter != "" && resp.Team != teamFilter {
 			continue
+		}
+		// L3 (worker-scoped) readers never receive plaintext credentials:
+		// scrub the MCP endpoint URLs before the response leaves the server.
+		// Other callers get the verbatim spec.
+		if caller != nil && caller.IsWorkerScoped() {
+			sanitizeWorkerResponseForL3(&resp)
 		}
 		workers = append(workers, resp)
 	}
@@ -1141,6 +1158,57 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		resp.ExposedPorts = append(resp.ExposedPorts, ExposedPortInfo{Port: ep.Port, Domain: ep.Domain})
 	}
 	return resp
+}
+
+// sanitizeWorkerResponseForL3 scrubs credential material from a worker
+// response before it is served to an L3 (worker-scoped) reader. The MCP
+// server URLs are the credential-bearing field: an endpoint URL may embed
+// the API key in the query (?api_key=..., ?apiKey=..., ?key=...) or in the
+// userinfo component (https://user:pass@host). Each URL is reduced to
+// scheme://host[:port]/path — the query and fragment are unclassified
+// input and dropped wholesale, not filtered key by key. No other
+// WorkerResponse field carries
+// secret material on the L3 read surfaces (audited: channel configs are
+// sanitized separately on the channel routes; the approval endpoint returns
+// a single level; checkpoints/workspace-files hide as 404 for L3; the
+// runtime-status endpoint is authorizer-denied for humans).
+func sanitizeWorkerResponseForL3(resp *WorkerResponse) {
+	for i := range resp.McpServers {
+		resp.McpServers[i].URL = sanitizeMCPURLForL3(resp.McpServers[i].URL)
+	}
+}
+
+// sanitizeMCPURLForL3 reduces an MCP endpoint URL to the metadata an L3
+// (worker-scoped) reader may safely see: scheme, host, port and path.
+//
+// MCP endpoints are arbitrary external URLs, so their query strings are
+// unclassified input. A denylist of known credential field names (such as
+// the L3 channel-config denylist) cannot be a complete credential contract
+// for that namespace — apiKey, key, token, or any vendor-specific name may
+// carry a secret. The query and fragment are therefore dropped wholesale,
+// along with the userinfo component (always secret in this context); no
+// query value, classified or not, is exposed to L3. scheme://host[:port]/
+// path still identifies the endpoint without exposing values.
+//
+// A URL without userinfo, query, or fragment is returned byte-identical.
+// It fails closed: a URL that cannot be parsed, is not absolute, or has no
+// host is a URL we cannot prove clean, so it is omitted entirely.
+func sanitizeMCPURLForL3(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return ""
+	}
+	if u.User == nil && u.RawQuery == "" && u.Fragment == "" {
+		return raw
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	return u.String()
 }
 
 func teamToResponse(t *v1beta1.Team) TeamResponse {
