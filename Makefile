@@ -149,11 +149,11 @@ OPENCLAW_BASE_PUSH_ARG  = --build-arg OPENCLAW_BASE_IMAGE=$(OPENCLAW_BASE_IMAGE)
 
 build-agentteams-controller: ## Build agentteams-controller image (prerequisite for Manager)
 	@echo "==> Building agentteams-controller image: $(LOCAL_CONTROLLER)"
-	@rm -rf ./agentteams-controller/agent && cp -r ./manager/agent ./agentteams-controller/agent
+	@rm -rf ./agentteams-controller/agent ./agentteams-controller/plugins && cp -r ./manager/agent ./agentteams-controller/agent && cp -r ./plugins ./agentteams-controller/plugins
 	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
 		-t $(LOCAL_CONTROLLER) \
 		./agentteams-controller/
-	@rm -rf ./agentteams-controller/agent
+	@rm -rf ./agentteams-controller/agent ./agentteams-controller/plugins
 
 build-manager: build-agentteams-controller ## Build Manager image (OpenClaw runtime)
 	@echo "==> Building Manager image: $(LOCAL_MANAGER) (registry: $(HIGRESS_REGISTRY))"
@@ -296,7 +296,7 @@ endif
 
 push-agentteams-controller: buildx-setup ## Build + push multi-arch agentteams-controller image
 	@echo "==> Building + pushing multi-arch agentteams-controller: $(CONTROLLER_TAG) [$(MULTIARCH_PLATFORMS)]"
-	@rm -rf ./agentteams-controller/agent && cp -r ./manager/agent ./agentteams-controller/agent
+	@rm -rf ./agentteams-controller/agent ./agentteams-controller/plugins && cp -r ./manager/agent ./agentteams-controller/agent && cp -r ./plugins ./agentteams-controller/plugins
 ifeq ($(IS_PODMAN),1)
 	-podman manifest rm $(CONTROLLER_TAG) 2>/dev/null
 	$(foreach plat,$(subst $(comma), ,$(MULTIARCH_PLATFORMS)), \
@@ -319,7 +319,7 @@ else
 		--push \
 		./agentteams-controller/
 endif
-	@rm -rf ./agentteams-controller/agent
+	@rm -rf ./agentteams-controller/agent ./agentteams-controller/plugins
 
 push-embedded: push-agentteams-controller buildx-setup ## Build + push multi-arch embedded all-in-one image
 	@echo "==> Building + pushing multi-arch agentteams-embedded: $(EMBEDDED_TAG) [$(MULTIARCH_PLATFORMS)]"
@@ -947,11 +947,11 @@ help: ## Show this help
 # Variables:
 #   DASHBOARD_CONTEXT   Path to dashboard source tree (default: ../agentteams-dashboard)
 #   DASHBOARD_IMAGE     Override dashboard image (derived from DASHBOARD_VERSION by default)
-#   DASHBOARD_VERSION   Dashboard version tag (default: v1.2.4)
+#   DASHBOARD_VERSION   Dashboard version tag (default: v1.2.4.9)
 #   AGENTTEAMS_PORT_DASHBOARD   Dashboard host port (default: 13000)
 
 DASHBOARD_CONTEXT ?= ../agentteams-dashboard
-DASHBOARD_VERSION ?= v1.2.4
+DASHBOARD_VERSION ?= v1.2.4.9
 DASHBOARD_IMAGE ?= $(REGISTRY)/$(REPO)/agentteams-dashboard:$(DASHBOARD_VERSION)
 AGENTTEAMS_PORT_DASHBOARD ?= 13000
 

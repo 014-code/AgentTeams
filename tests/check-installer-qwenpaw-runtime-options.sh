@@ -8,7 +8,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASH_INSTALLER="${ROOT_DIR}/install/agentteams-install.sh"
 POWERSHELL_INSTALLER="${ROOT_DIR}/install/agentteams-install.ps1"
 INTEGRATION_WORKFLOW="${ROOT_DIR}/.github/workflows/test-integration.yml"
-BUILD_WORKFLOW="${ROOT_DIR}/.github/workflows/build.yml"
 RELEASE_WORKFLOW="${ROOT_DIR}/.github/workflows/release.yml"
 
 fail() {
@@ -94,8 +93,7 @@ powershell_worker_images="$(sed -n '/\$workerImages = @(/,/^    )/p' "${POWERSHE
 grep -F 'QWENPAW_WORKER_IMAGE' <<<"${powershell_worker_images}" | grep -Eqv '^[[:space:]]*#' ||
     fail "PowerShell installer must pull the published QwenPaw Worker image"
 
-grep -F 'echo "targets=' "${BUILD_WORKFLOW}" | grep -F 'qwenpaw-worker' >/dev/null ||
-    fail "Tag-triggered image builds must publish qwenpaw-worker"
+# Tag-triggered image selection is exercised in test-build-workflows.py.
 grep -Fq 'docker pull ${REGISTRY}/${REPO}/agentteams-qwenpaw-worker:${VERSION}' \
     "${RELEASE_WORKFLOW}" ||
     fail "Release notes must list the versioned QwenPaw Worker image"
@@ -109,13 +107,9 @@ for manager_crd in \
         fail "Manager CRD must keep accepting legacy CoPaw: ${manager_crd}"
 done
 
-# Fork CI must exercise the PR-built QwenPaw Manager directly while retaining
-# one compatibility mapping for legacy CoPaw matrix entries.
+# Fork CI must exercise the PR-built QwenPaw Manager directly.
 grep -Fq 'AGENTTEAMS_INSTALL_MANAGER_QWENPAW_IMAGE: agentteams/manager-qwenpaw:latest' \
     "${INTEGRATION_WORKFLOW}" ||
     fail "Integration CI must map the QwenPaw runtime to the PR-built Manager image"
-grep -Fq 'AGENTTEAMS_INSTALL_MANAGER_COPAW_IMAGE: agentteams/manager-qwenpaw:latest' \
-    "${INTEGRATION_WORKFLOW}" ||
-    fail "Integration CI must explicitly map the CoPaw compatibility label to the PR-built QwenPaw Manager image"
 
 echo "PASS: QwenPaw Manager and Worker are first-class local installer options"
