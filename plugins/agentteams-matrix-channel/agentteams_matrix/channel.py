@@ -89,6 +89,8 @@ TYPING_MAX_DURATION_S = 120
 DM_CACHE_TTL_MS = 30_000
 DM_MEMBERSHIP_TIMEOUT_S = 5.0
 MATRIX_EVENT_CALLBACK_TIMEOUT_S = 120.0
+MATRIX_SYNC_STATE_FILENAME = "matrix_sync_state.json"
+MATRIX_SYNC_MAX_ACCEPTED_EVENT_IDS = 4096
 TASK_ROOM_CACHE_TTL_MS = 30_000
 MATRIX_EVENT_PROTOCOL_LIMIT_BYTES = 64 * 1024
 MATRIX_TEXT_EVENT_SAFE_BYTES = (MATRIX_EVENT_PROTOCOL_LIMIT_BYTES * 3) // 4
@@ -432,8 +434,12 @@ class AgentTeamsMatrixChannel(BaseChannel):
         self._callback_tasks: set[asyncio.Task[Any]] = set()
         self._room_callback_locks: Dict[str, asyncio.Lock] = {}
         self._active_sync_callback_futures: Optional[list[asyncio.Future[bool]]] = None
+        self._callback_event_ids: Dict[asyncio.Future[bool], str] = {}
+        self._inflight_callback_futures: Dict[str, asyncio.Future[bool]] = {}
+        self._accepted_event_ids: set[str] = set()
+        self._durable_sync_token: Optional[str] = None
         self._pending_sync_checkpoints: list[
-            tuple[str, set[asyncio.Future[bool]]]
+            tuple[str, set[asyncio.Future[bool]], set[str]]
         ] = []
         self._checkpoint_recovery_required = False
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -850,10 +856,42 @@ class AgentTeamsMatrixChannel(BaseChannel):
         to use the network, so run them independently and keep their failures
         visible instead of letting one callback stall all later events.
         """
+        event_id = str(getattr(event, "event_id", "") or "")
         acceptance: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        callback_event_ids = getattr(self, "_callback_event_ids", None)
+        if callback_event_ids is None:
+            callback_event_ids = {}
+            self._callback_event_ids = callback_event_ids
+        callback_event_ids[acceptance] = event_id
         active_futures = getattr(self, "_active_sync_callback_futures", None)
         if active_futures is not None:
             active_futures.append(acceptance)
+
+        accepted_event_ids = getattr(self, "_accepted_event_ids", set())
+        if event_id and event_id in accepted_event_ids:
+            # The event was consumed before a previous checkpoint was
+            # persisted.  It is safe to acknowledge it without re-enqueueing
+            # the request when Matrix replays the durable token.
+            acceptance.set_result(True)
+            return
+
+        inflight_futures = getattr(self, "_inflight_callback_futures", None)
+        if inflight_futures is None:
+            inflight_futures = {}
+            self._inflight_callback_futures = inflight_futures
+        inflight = inflight_futures.get(event_id)
+        if event_id and inflight is not None and not inflight.done():
+            # matrix-nio should not deliver the same event twice in one sync,
+            # but sharing the acceptance future makes duplicate delivery
+            # harmless if it does happen during recovery.
+            if active_futures is not None:
+                active_futures[-1] = inflight
+            callback_event_ids.pop(acceptance, None)
+            return
+
+        callback_event_ids[acceptance] = event_id
+        if event_id:
+            inflight_futures[event_id] = acceptance
         acceptance.add_done_callback(
             lambda _future: self._flush_pending_sync_checkpoints(),
         )
@@ -880,15 +918,50 @@ class AgentTeamsMatrixChannel(BaseChannel):
     ) -> None:
         """Remove a callback task and fail acceptance if it never started."""
         self._callback_tasks.discard(task)
+        callback_event_ids = getattr(self, "_callback_event_ids", {})
+        inflight_futures = getattr(self, "_inflight_callback_futures", {})
+        event_id = callback_event_ids.get(acceptance, "")
+        if event_id and inflight_futures.get(event_id) is acceptance:
+            inflight_futures.pop(event_id, None)
         if not acceptance.done():
             acceptance.set_result(False)
 
-    @staticmethod
-    def _mark_event_callback_accepted() -> None:
+    def _mark_event_callback_accepted(self) -> None:
         """Mark the current callback safe to include in a sync checkpoint."""
         acceptance = _CURRENT_CALLBACK_ACCEPTANCE.get()
         if acceptance is not None and not acceptance.done():
-            acceptance.set_result(True)
+            if self._record_accepted_event(acceptance):
+                acceptance.set_result(True)
+
+    def _record_accepted_event(self, acceptance: asyncio.Future[bool]) -> bool:
+        """Persist an accepted event until its sync checkpoint is durable."""
+        event_id = getattr(self, "_callback_event_ids", {}).get(acceptance, "")
+        if not event_id:
+            return True
+        accepted_event_ids = getattr(self, "_accepted_event_ids", None)
+        if accepted_event_ids is None:
+            accepted_event_ids = set()
+            self._accepted_event_ids = accepted_event_ids
+        if event_id in accepted_event_ids:
+            return True
+        if len(accepted_event_ids) >= MATRIX_SYNC_MAX_ACCEPTED_EVENT_IDS:
+            logger.error(
+                "MatrixChannel: accepted event ledger is full; "
+                "holding sync checkpoint component=matrix max_events=%s",
+                MATRIX_SYNC_MAX_ACCEPTED_EVENT_IDS,
+            )
+            return False
+        accepted_event_ids.add(event_id)
+        if not getattr(self, "_durable_sync_token", None):
+            # Unit-test/manual callback paths can run before a sync token is
+            # loaded.  The real sync loop always loads the durable token
+            # before scheduling callbacks, so this in-memory fallback cannot
+            # acknowledge an event across a restart.
+            return True
+        if self._persist_sync_state():
+            return True
+        accepted_event_ids.remove(event_id)
+        return False
 
     def _get_room_callback_lock(self, room_id: str) -> asyncio.Lock:
         """Return the lock that serializes callbacks for one Matrix room."""
@@ -945,6 +1018,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
                 # that timed out, failed, or was cancelled must keep the
                 # sync token behind it so the event is replayed after a
                 # restart.
+                if completed:
+                    completed = self._record_accepted_event(acceptance)
                 acceptance.set_result(completed)
             _CURRENT_CALLBACK_ACCEPTANCE.reset(context_token)
 
@@ -954,19 +1029,27 @@ class AgentTeamsMatrixChannel(BaseChannel):
         if batches is None:
             return
         while batches:
-            token, acceptances = batches[0]
+            token, acceptances, event_ids = batches[0]
             if any(not acceptance.done() for acceptance in acceptances):
                 return
             if any(acceptance.cancelled() or not acceptance.result() for acceptance in acceptances):
                 self._checkpoint_recovery_required = True
-                batches.clear()
                 logger.error(
-                    "MatrixChannel: sync checkpoint blocked after an "
-                    "unaccepted event callback component=matrix",
+                    "MatrixChannel: sync checkpoint requires replay after "
+                    "an unaccepted event callback component=matrix",
+                )
+                return
+            if self._save_sync_token(token, event_ids) is False:
+                self._checkpoint_recovery_required = True
+                logger.error(
+                    "MatrixChannel: sync checkpoint persistence failed; "
+                    "replaying from the last durable token component=matrix",
                 )
                 return
             batches.pop(0)
-            self._save_sync_token(token)
+            callback_event_ids = getattr(self, "_callback_event_ids", {})
+            for acceptance in acceptances:
+                callback_event_ids.pop(acceptance, None)
 
     def _queue_sync_checkpoint(
         self,
@@ -977,15 +1060,48 @@ class AgentTeamsMatrixChannel(BaseChannel):
         if not token:
             return
         if getattr(self, "_checkpoint_recovery_required", False):
-            logger.error(
-                "MatrixChannel: sync checkpoint persistence disabled after "
-                "an unaccepted event callback component=matrix",
+            logger.debug(
+                "MatrixChannel: delaying sync checkpoint until callback "
+                "recovery completes component=matrix",
             )
             return
+        callback_event_ids = getattr(self, "_callback_event_ids", {})
         self._pending_sync_checkpoints.append(
-            (token, set(acceptances)),
+            (
+                token,
+                set(acceptances),
+                {
+                    event_id
+                    for acceptance in acceptances
+                    if (event_id := callback_event_ids.get(acceptance))
+                },
+            ),
         )
         self._flush_pending_sync_checkpoints()
+
+    async def _recover_sync_checkpoint(self) -> Optional[str]:
+        """Drain callbacks and return to the last durable token for replay."""
+        if not getattr(self, "_checkpoint_recovery_required", False):
+            return None
+        callback_tasks = tuple(getattr(self, "_callback_tasks", set()))
+        if callback_tasks:
+            await asyncio.gather(*callback_tasks, return_exceptions=True)
+        durable_token = getattr(self, "_durable_sync_token", None)
+        if not durable_token:
+            durable_token = self._load_sync_token()
+        if not durable_token:
+            raise RuntimeError(
+                "MatrixChannel cannot recover a failed callback without "
+                "a durable sync token",
+            )
+        self._pending_sync_checkpoints.clear()
+        getattr(self, "_callback_event_ids", {}).clear()
+        self._checkpoint_recovery_required = False
+        logger.warning(
+            "MatrixChannel: replaying callbacks from durable sync token "
+            "after callback failure component=matrix",
+        )
+        return durable_token
 
     async def _sync_with_callback_tracking(
         self,
@@ -1150,6 +1266,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
             await asyncio.gather(*callback_tasks, return_exceptions=True)
             self._callback_tasks.clear()
         getattr(self, "_pending_sync_checkpoints", []).clear()
+        getattr(self, "_callback_event_ids", {}).clear()
+        getattr(self, "_inflight_callback_futures", {}).clear()
         self._room_callback_locks.clear()
         if self._typing_tasks:
             typing_tasks = tuple(self._typing_tasks.values())
@@ -1177,7 +1295,12 @@ class AgentTeamsMatrixChannel(BaseChannel):
     @staticmethod
     def _sync_token_path() -> Optional[Path]:
         """Return the file path for persisting the Matrix sync token."""
-        return WORKING_DIR / "matrix_sync_token"
+        return Path(WORKING_DIR) / "matrix_sync_token"
+
+    @staticmethod
+    def _sync_state_path() -> Path:
+        """Return the durable token plus accepted-event ledger path."""
+        return Path(WORKING_DIR) / MATRIX_SYNC_STATE_FILENAME
 
     @staticmethod
     def _auth_state_path() -> Path:
@@ -1288,11 +1411,42 @@ class AgentTeamsMatrixChannel(BaseChannel):
         startup, so it's already on disk when this runs — even on a fresh
         container after destroy/recreate.
         """
+        state_path = self._sync_state_path()
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                token = str(state.get("sync_token") or "").strip()
+                accepted_event_ids = state.get("accepted_event_ids", [])
+                if not isinstance(accepted_event_ids, list):
+                    accepted_event_ids = []
+                self._accepted_event_ids = {
+                    str(event_id)
+                    for event_id in accepted_event_ids
+                    if str(event_id)
+                }
+                self._durable_sync_token = token or None
+                if token:
+                    logger.info(
+                        "MatrixChannel: restored sync state from %s "
+                        "accepted_events=%s",
+                        state_path,
+                        len(self._accepted_event_ids),
+                    )
+                    return token
+            except Exception as exc:
+                logger.warning(
+                    "MatrixChannel: failed to read sync state from %s: %s",
+                    state_path,
+                    exc,
+                )
+
         path = self._sync_token_path()
         if path and path.exists():
             try:
-                token = path.read_text().strip()
+                token = path.read_text(encoding="utf-8").strip()
                 if token:
+                    self._accepted_event_ids = set()
+                    self._durable_sync_token = token
                     logger.info(
                         "MatrixChannel: restored sync token from %s",
                         path,
@@ -1303,20 +1457,77 @@ class AgentTeamsMatrixChannel(BaseChannel):
                     "MatrixChannel: failed to read sync token: %s",
                     exc,
                 )
+        self._accepted_event_ids = set()
+        self._durable_sync_token = None
         return None
 
-    def _save_sync_token(self, token: str) -> None:
-        """Persist next_batch token to disk (push_loop uploads it to MinIO)."""
+    def _persist_sync_state(self) -> bool:
+        """Persist accepted events while retaining the durable token."""
+        token = getattr(self, "_durable_sync_token", None)
+        if not token:
+            return False
+        path = self._sync_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_name(f".{path.name}.tmp")
+            payload = {
+                "sync_token": token,
+                "accepted_event_ids": sorted(
+                    getattr(self, "_accepted_event_ids", set()),
+                ),
+            }
+            temp_path.write_text(
+                json.dumps(payload, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "MatrixChannel: failed to persist sync state: %s",
+                exc,
+            )
+            return False
+
+    def _save_sync_token(
+        self,
+        token: str,
+        retired_event_ids: Optional[set[str]] = None,
+    ) -> bool:
+        """Persist a token and retire only events covered by that token."""
+        state_path = self._sync_state_path()
         path = self._sync_token_path()
-        if path:
-            try:
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = state_path.with_name(f".{state_path.name}.tmp")
+            accepted_event_ids = set(
+                getattr(self, "_accepted_event_ids", set()),
+            )
+            if retired_event_ids is None:
+                accepted_event_ids.clear()
+            else:
+                accepted_event_ids.difference_update(retired_event_ids)
+            payload = {
+                "sync_token": token,
+                "accepted_event_ids": sorted(accepted_event_ids),
+            }
+            temp_path.write_text(
+                json.dumps(payload, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temp_path.replace(state_path)
+            if path:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(token)
-            except Exception as exc:
-                logger.warning(
-                    "MatrixChannel: failed to save sync token: %s",
-                    exc,
-                )
+                path.write_text(token, encoding="utf-8")
+            self._durable_sync_token = token
+            self._accepted_event_ids = accepted_event_ids
+            return True
+        except Exception as exc:
+            logger.warning(
+                "MatrixChannel: failed to save sync token: %s",
+                exc,
+            )
+            return False
 
     async def _e2ee_maintenance(self) -> None:
         """Perform E2EE key maintenance tasks after each sync.
@@ -1916,6 +2127,11 @@ class AgentTeamsMatrixChannel(BaseChannel):
 
         while True:
             try:
+                if self._checkpoint_recovery_required:
+                    recovered_token = await self._recover_sync_checkpoint()
+                    if recovered_token:
+                        next_batch = recovered_token
+                    continue
                 resp, acceptances = await self._sync_with_callback_tracking(
                     timeout=self.sync_timeout_ms,
                     since=next_batch,
